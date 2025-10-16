@@ -1,0 +1,4 @@
+*.json
+secrets.json
+./data/*
+./temp/*
