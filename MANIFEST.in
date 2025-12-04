@@ -1,0 +1,36 @@
+# Include documentation
+include README.md
+include readme.md
+include LICENSE
+
+# Include secrets template (not actual secrets)
+exclude secrets.json
+exclude */secrets.json
+
+# Include package data
+recursive-include markets *.py
+recursive-include markets/submodules *.py
+
+# Exclude compiled Python files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+
+# Exclude git files
+global-exclude .git*
+global-exclude .DS_Store
+
+# Exclude development files
+exclude .gitignore
+exclude .gitattributes
+
+# Exclude test and output directories
+recursive-exclude tests *
+recursive-exclude wip *
+recursive-exclude output *
+recursive-exclude img *
+recursive-exclude __pycache__ *
+
+# Exclude notebooks (users can access these from repo)
+exclude *.ipynb
+recursive-exclude * *.ipynb
