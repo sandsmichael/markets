@@ -1485,6 +1485,7 @@ class Chain:
 
 
     def get_chain(self, max_expiration=None):
+        print(f'Fetching Chain for {self.ticker}...')
         if max_expiration is None: max_expiration = (datetime.today() + relativedelta(months=12)).strftime("%Y-%m-%d")
         else: max_expiration = max_expiration
 
@@ -1663,7 +1664,7 @@ class ChainHistory:
             
             url = "https://eodhd.com/api/mp/unicornbay/options/eod"
             params = {
-                "filter[underlying_symbol]": self.ticker,
+                "filter[underlying_symbol]": f"{self.ticker}.US",
                 "filter[tradetime_from]": current_start.strftime("%Y-%m-%d"),
                 "filter[tradetime_to]": chunk_end.strftime("%Y-%m-%d"),                
                 # "filter[exp_date_from]": current_start.strftime("%Y-%m-%d"),
@@ -2008,3 +2009,217 @@ class ChainHistory:
 
 
 
+
+class News:
+    """
+    Retrieve financial news from EODHD API.
+    
+    EODHD News API provides:
+    - Latest financial news by ticker
+    - News by date range
+    - News tags and categories
+    - Sentiment analysis (if available)
+    """
+    
+    def __init__(self):
+        """Initialize News client using global API_KEY."""
+        self.api_key = API_KEY
+        self.base_url = "https://eodhd.com/api/news"
+    
+    def get_ticker_news(self, ticker, limit=50, offset=0, from_date=None, to_date=None):
+        """
+        Get news for a specific ticker.
+        
+        Parameters:
+        -----------
+        ticker : str
+            Ticker symbol (e.g., 'AAPL.US', 'SPY')
+        limit : int
+            Number of news items to retrieve (max 1000)
+        offset : int
+            Offset for pagination
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            News articles with date, title, content, link, symbols, tags, sentiment
+        """
+        params = {
+            'api_token': self.api_key,
+            's': ticker,
+            'limit': limit,
+            'offset': offset,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        
+        response = requests.get(self.base_url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data)
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=False).reset_index(drop=True)
+        
+        return df
+    
+    def get_latest_news(self, limit=50, offset=0, from_date=None, to_date=None):
+        """
+        Get latest financial news (all markets).
+        
+        Parameters:
+        -----------
+        limit : int
+            Number of news items to retrieve (max 1000)
+        offset : int
+            Offset for pagination
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            News articles with date, title, content, link, symbols, tags
+        """
+        params = {
+            'api_token': self.api_key,
+            'limit': limit,
+            'offset': offset,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        
+        response = requests.get(self.base_url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data)
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=False).reset_index(drop=True)
+        
+        return df
+    
+    def get_multiple_tickers_news(self, tickers, limit=50, from_date=None, to_date=None):
+        """
+        Get news for multiple tickers.
+        
+        Parameters:
+        -----------
+        tickers : list[str]
+            List of ticker symbols
+        limit : int
+            Number of news items per ticker
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Combined news articles from all tickers
+        """
+        all_news = []
+        
+        for ticker in tickers:
+            try:
+                df = self.get_ticker_news(
+                    ticker=ticker,
+                    limit=limit,
+                    from_date=from_date,
+                    to_date=to_date
+                )
+                if not df.empty:
+                    df['primary_ticker'] = ticker
+                    all_news.append(df)
+            except Exception as e:
+                print(f"Error fetching news for {ticker}: {e}")
+                continue
+        
+        if not all_news:
+            return pd.DataFrame()
+        
+        combined = pd.concat(all_news, ignore_index=True)
+        
+        # Remove duplicates based on title
+        combined = combined.drop_duplicates(subset=['title'], keep='first')
+        
+        # Sort by date
+        if 'date' in combined.columns:
+            combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
+        
+        return combined
+    
+    def search_news(self, keywords, limit=50, from_date=None, to_date=None):
+        """
+        Search news by keywords (filters results client-side).
+        
+        Parameters:
+        -----------
+        keywords : str or list[str]
+            Keyword(s) to search for in title and content
+        limit : int
+            Number of initial news items to fetch and filter
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Filtered news articles containing keywords
+        """
+        # Get latest news
+        df = self.get_latest_news(limit=limit, from_date=from_date, to_date=to_date)
+        
+        if df.empty:
+            return df
+        
+        # Convert keywords to list
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        
+        # Filter by keywords (case-insensitive)
+        mask = pd.Series(False, index=df.index)
+        for keyword in keywords:
+            if 'title' in df.columns:
+                mask |= df['title'].str.contains(keyword, case=False, na=False)
+            if 'content' in df.columns:
+                mask |= df['content'].str.contains(keyword, case=False, na=False)
+        
+        return df[mask].reset_index(drop=True)
+
+
+# Initialize News class
+news = News()
+
+print("✓ News class created")
