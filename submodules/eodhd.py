@@ -1081,6 +1081,7 @@ class Index:
         period: str = 'quarterly',
         date: Optional[str] = None,
         max_workers: int = 10,
+        top_n: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Fetch fundamental fields for all constituents with parallel processing.
@@ -1102,6 +1103,8 @@ class Index:
             Target date for data retrieval
         max_workers : int
             Number of parallel threads
+        top_n : int, optional
+            If specified, only fetch fundamentals for top N holdings by weight
         
         Returns
         -------
@@ -1115,11 +1118,18 @@ class Index:
             field_paths = [field_paths]
         
         field_names = [fp.split('::')[-1] for fp in field_paths]
-        print(f"\nFetching {len(field_names)} fields (parallel with {max_workers} threads)...")
+        
+        # Filter to top N holdings if specified
+        if top_n is not None:
+            constituent_tickers = self.constituents.nlargest(top_n, 'Weight')['Ticker']
+            print(f"\nFetching {len(field_names)} fields for top {top_n} holdings (parallel with {max_workers} threads)...")
+        else:
+            constituent_tickers = self.constituents['Ticker']
+            print(f"\nFetching {len(field_names)} fields for all {len(constituent_tickers)} constituents (parallel with {max_workers} threads)...")
+        
         print(f"Fields: {', '.join(field_names)}")
         
         results = []
-        constituent_tickers = self.constituents['Ticker']
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -1384,11 +1394,19 @@ class Security(TechnicalAnalysis, FundamentalAnalysis):
 class Chain:
     # Aggregate analysis across all strikes and expiries on the chain.
 
-    def __init__(self, ticker, max_expiration=None):
+    def __init__(self, ticker, max_expiration=None, refresh=False):
         self.underlying = Security(ticker)
         self.ticker = ticker
+        self.refresh = refresh
         
-        self.chain = self.get_chain(max_expiration=max_expiration)
+        # Set default max_expiration
+        self.max_expiration = max_expiration if max_expiration else (datetime.today() + relativedelta(months=12)).strftime("%Y-%m-%d")
+        
+        # Create filepath for cached data
+        today = datetime.today().strftime("%Y-%m-%d")
+        self.fp_chain = os.path.join(r"C:\Users\msands\OneDrive\Documents\data\EODHD Options Chain\\", f'{self.ticker}_Chain_{today}_{self.max_expiration}.pkl')
+        
+        self.chain = self._load_or_fetch_data()
         self.monthlies = self.chain[self.chain['expiration_type'] == 'monthly']
         self.weeklies = self.chain[self.chain['expiration_type'] == 'weekly']
 
@@ -1484,20 +1502,110 @@ class Chain:
         return df[~df['tradetime'].isna()]
 
 
-    def get_chain(self, max_expiration=None):
-        print(f'Fetching Chain for {self.ticker}...')
-        if max_expiration is None: max_expiration = (datetime.today() + relativedelta(months=12)).strftime("%Y-%m-%d")
-        else: max_expiration = max_expiration
+    def _find_existing_data(self):
+        """Find existing pickle files for this ticker from today"""
+        data_dir = r"C:\Users\msands\OneDrive\Documents\data\EODHD Options Chain"
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
+            return None, None
+        
+        today = datetime.today().strftime("%Y-%m-%d")
+        # Pattern: {ticker}_Chain_{today}_{max_exp}.pkl
+        ticker_today_pattern = f"{self.ticker}_Chain_{today}_"
+        
+        matching_files = []
+        for filename in os.listdir(data_dir):
+            if filename.startswith(ticker_today_pattern) and filename.endswith('.pkl'):
+                # Extract max_expiration from filename
+                try:
+                    max_exp_part = filename.replace(ticker_today_pattern, '').replace('.pkl', '')
+                    # Validate it's a date
+                    pd.to_datetime(max_exp_part)
+                    matching_files.append((filename, max_exp_part))
+                except:
+                    continue
+        
+        if not matching_files:
+            return None, None
+        
+        # Sort by max_expiration and get the one that covers our range
+        matching_files.sort(key=lambda x: pd.to_datetime(x[1]), reverse=True)
+        
+        # Find a file that covers our requested max_expiration
+        for filename, file_max_exp in matching_files:
+            if pd.to_datetime(file_max_exp) >= pd.to_datetime(self.max_expiration):
+                file_path = os.path.join(data_dir, filename)
+                print(f"Found existing data: {filename}")
+                
+                try:
+                    existing_data = pd.read_pickle(file_path)
+                    return existing_data, file_max_exp
+                except Exception as e:
+                    print(f"Error loading existing file {filename}: {e}")
+                    continue
+        
+        return None, None
 
+    def _load_or_fetch_data(self):
+        """Smart loading: use existing data if available and current, otherwise fetch new"""
+        
+        # If refresh=True, always fetch new data
+        if self.refresh:
+            print(f"Refresh=True: Fetching new data for {self.ticker}")
+            return self.fetch_chain()
+        
+        # Check if exact file exists
+        if os.path.exists(self.fp_chain):
+            print(f"Loading existing data from {self.fp_chain}")
+            return pd.read_pickle(self.fp_chain)
+        else:
+            # Look for existing files from today that cover our expiration range
+            existing_data, existing_max_exp = self._find_existing_data()
+            
+            if existing_data is not None:
+                # Filter to our requested max_expiration range
+                existing_data['exp_date'] = pd.to_datetime(existing_data['exp_date'])
+                filtered_data = existing_data[existing_data['exp_date'] <= pd.to_datetime(self.max_expiration)]
+                
+                if not filtered_data.empty:
+                    print(f"Using existing data filtered to {self.max_expiration}")
+                    # Save filtered data to our specific filepath for future use
+                    filtered_data.to_pickle(self.fp_chain)
+                    return filtered_data
+                else:
+                    print(f"Existing data doesn't cover requested range, fetching new data")
+                    return self.fetch_chain()
+            else:
+                print(f"No existing data found for today. Fetching new data for {self.ticker}")
+                return self.fetch_chain()
+
+    def fetch_chain(self):
+        """Fetch chain data from API"""
+        print(f'Fetching Chain for {self.ticker}...')
+        
         url = "https://eodhd.com/api/mp/unicornbay/options/contracts"
         params = {
             "filter[underlying_symbol]": self.ticker,
             "filter[exp_date_from]": datetime.today().strftime("%Y-%m-%d"),
-            "filter[exp_date_to]": max_expiration,
+            "filter[exp_date_to]": self.max_expiration,
             "sort": "-exp_date",
         }
         df = pd.DataFrame(EODHD().paginate(url=url, params_base=params, offset=0, total=None))
-        return df #df[(df['delta']!=0) & (df['expiration_type']=='monthly') ] # & (df['volume']>0)
+        
+        # Save to pickle for future use
+        if not df.empty:
+            os.makedirs(os.path.dirname(self.fp_chain), exist_ok=True)
+            df.to_pickle(self.fp_chain)
+            print(f"Chain data saved to {self.fp_chain}")
+        
+        return df
+
+    def get_chain(self, max_expiration=None):
+        """Deprecated: Use fetch_chain() or rely on automatic loading in __init__"""
+        print("Warning: get_chain() is deprecated. Chain data is loaded automatically in __init__")
+        if max_expiration and max_expiration != self.max_expiration:
+            print(f"Note: Requested max_expiration {max_expiration} differs from initialized {self.max_expiration}")
+        return self.chain
 
 
     def get_atm_avg(self):
@@ -2219,7 +2327,284 @@ class News:
         return df[mask].reset_index(drop=True)
 
 
-# Initialize News class
-news = News()
 
-print("✓ News class created")
+class MarketCalendar:
+    """
+    Retrieve financial calendar data from EODHD API.
+    
+    EODHD Calendar API provides:
+    - Earnings announcements
+    - IPO calendar
+    - Stock splits
+    - Economic events
+    - Dividend dates
+    """
+    
+    def __init__(self):
+        """Initialize MarketCalendar client using global API_KEY."""
+        self.api_key = API_KEY
+        self.base_url = "https://eodhd.com/api/calendar"
+    
+    def get_earnings(self, from_date=None, to_date=None, symbols=None):
+        """
+        Get earnings announcements calendar.
+        
+        Parameters:
+        -----------
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+        symbols : str or list
+            Ticker symbol(s) to filter (e.g., 'AAPL.US' or ['AAPL.US', 'MSFT.US'])
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Earnings calendar with date, ticker, estimate, actual values
+        """
+        url = f"{self.base_url}/earnings"
+        params = {
+            'api_token': self.api_key,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        if symbols:
+            if isinstance(symbols, list):
+                params['symbols'] = ','.join(symbols)
+            else:
+                params['symbols'] = symbols
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data or not data.get('earnings'):
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data['earnings'])
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=True).reset_index(drop=True)
+        
+        return df
+    
+    def get_ipos(self, from_date=None, to_date=None):
+        """
+        Get upcoming IPO calendar.
+        
+        Parameters:
+        -----------
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            IPO calendar with date, ticker, name, exchange, price range
+        """
+        url = f"{self.base_url}/ipos"
+        params = {
+            'api_token': self.api_key,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data or not data.get('ipos'):
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data['ipos'])
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=True).reset_index(drop=True)
+        
+        return df
+    
+    def get_splits(self, from_date=None, to_date=None, symbols=None):
+        """
+        Get stock splits calendar.
+        
+        Parameters:
+        -----------
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+        symbols : str or list
+            Ticker symbol(s) to filter
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Stock splits with date, ticker, split ratio
+        """
+        url = f"{self.base_url}/splits"
+        params = {
+            'api_token': self.api_key,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        if symbols:
+            if isinstance(symbols, list):
+                params['symbols'] = ','.join(symbols)
+            else:
+                params['symbols'] = symbols
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data or not data.get('splits'):
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data['splits'])
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=True).reset_index(drop=True)
+        
+        return df
+    
+    def get_economic_events(self, from_date=None, to_date=None, country=None, limit=1000, offset=0):
+        """
+        Get economic calendar events (GDP, CPI, unemployment, etc.).
+        
+        Parameters:
+        -----------
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+        country : str
+            Country code to filter (e.g., 'US', 'GB', 'JP')
+        limit : int
+            Number of events to retrieve (default 1000, max 1000)
+        offset : int
+            Offset for pagination (default 0)
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Economic events with date, country, event, actual, forecast, previous values
+        """
+        url = "https://eodhd.com/api/economic-events"
+        params = {
+            'api_token': self.api_key,
+            'fmt': 'json',
+            'limit': limit,
+            'offset': offset
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        if country:
+            params['country'] = country
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data)
+        
+        # Convert date to datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=True).reset_index(drop=True)
+        
+        return df
+    
+    def get_trends(self, from_date=None, to_date=None, symbols=None):
+        """
+        Get trends (market-moving events and sentiment) and concensus estimates.
+        
+        Parameters:
+        -----------
+        from_date : str
+            Start date in YYYY-MM-DD format
+        to_date : str
+            End date in YYYY-MM-DD format
+        symbols : str or list
+            Ticker symbol(s) to filter
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Market trends and events, normalized from nested structure
+        """
+        url = f"{self.base_url}/trends"
+        params = {
+            'api_token': self.api_key,
+            'fmt': 'json'
+        }
+        
+        if from_date:
+            params['from'] = from_date
+        if to_date:
+            params['to'] = to_date
+        if symbols:
+            symbols = [f'{s}.US' for s in symbols]
+            if isinstance(symbols, list):
+                params['symbols'] = ','.join(symbols)
+            else:
+                params['symbols'] = symbols
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data or not data.get('trends'):
+            return pd.DataFrame()
+        
+        # The API returns nested dictionaries - we need to flatten them
+        trends_list = []
+        for trend in data['trends']:
+            if isinstance(trend, dict):
+                trends_list.append(trend)
+            elif isinstance(trend, list):
+                # If it's a list of dicts, extend
+                trends_list.extend(trend)
+        
+        if not trends_list:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(trends_list)
+        
+        # Convert date to datetime if present
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=True).reset_index(drop=True)
+        
+        return df

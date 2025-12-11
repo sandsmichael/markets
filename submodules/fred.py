@@ -32,7 +32,7 @@ def find_secrets():
 SECRET_FP = find_secrets()
 with open(SECRET_FP, 'r') as file:
     secrets = json.load(file)
-API_KEY = secrets['eodhd_api_key']
+API_KEY = secrets['fred_api_key']
 
 
 
